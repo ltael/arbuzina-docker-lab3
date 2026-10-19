@@ -1,19 +1,45 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import httpx
+import psycopg2
 
 app = FastAPI(title="Personal Assistant")
 
 OWNER = os.getenv("APP_OWNER", "anonymous")
 SECRET_KEY = os.getenv("APP_SECRET", "default_secret")
 
+# ЛР3: строка подключения к PostgreSQL.
+# Формат: postgresql://пользователь:пароль@хост:порт/имя_бд
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 
 class Note(BaseModel):
     text: str
 
 
-notes: list[str] = []
+# Запасное хранилище в памяти: используется, только если DATABASE_URL не задан
+# (так приложение по-прежнему запускается без БД, как во второй лабе).
+memory_notes: list[str] = []
+
+
+def get_conn():
+    """Открывает новое соединение с PostgreSQL."""
+    return psycopg2.connect(DATABASE_URL, connect_timeout=3)
+
+
+def init_db(cur):
+    """Создаёт таблицу заметок, если её ещё нет."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notes (
+            id SERIAL PRIMARY KEY,
+            text TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """
+    )
 
 
 @app.get("/")
@@ -21,14 +47,39 @@ async def root():
     return {
         "message": f"👋 Привет, {OWNER}!",
         "service": "personal-assistant",
-        "version": "1.0",
-        "endpoints": ["/me", "/notes", "/weather/{city}", "/secret/{key}"],
+        "version": "3.0",
+        "storage": "postgresql" if DATABASE_URL else "memory",
+        "endpoints": ["/health", "/me", "/notes", "/weather/{city}", "/secret/{key}"],
     }
 
 
 @app.get("/health")
-async def health():
-    return {"status": "healthy", "owner": OWNER}
+def health():
+    result = {"status": "healthy", "owner": OWNER}
+    if not DATABASE_URL:
+        result["database"] = "not configured"
+        return result
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                version = cur.fetchone()[0]
+        finally:
+            conn.close()
+        result["database"] = "connected"
+        result["db_version"] = version.split(",")[0]
+        return result
+    except psycopg2.Error as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "owner": OWNER,
+                "database": "unavailable",
+                "error": str(e).strip(),
+            },
+        )
 
 
 @app.get("/me")
@@ -110,13 +161,56 @@ async def weather(city: str):
         return {"error": f"Failed to get weather: {type(e).__name__}: {e}"}
 
 
+# Обработчики заметок объявлены через обычный def (не async):
+# psycopg2 работает синхронно, и FastAPI сам запустит их в отдельном потоке,
+# не блокируя остальные запросы.
+
 @app.post("/notes")
-async def create_note(note: Note):
-    notes.append(note.text)
-    return {"status": "saved", "note_id": len(notes) - 1, "total": len(notes)}
+def create_note(note: Note):
+    if not DATABASE_URL:
+        memory_notes.append(note.text)
+        return {
+            "status": "saved",
+            "note_id": len(memory_notes) - 1,
+            "total": len(memory_notes),
+            "storage": "memory",
+        }
+
+    conn = get_conn()
+    try:
+        with conn:  # транзакция: COMMIT при успехе, ROLLBACK при ошибке
+            with conn.cursor() as cur:
+                init_db(cur)
+                cur.execute(
+                    "INSERT INTO notes (text) VALUES (%s) RETURNING id",
+                    (note.text,),
+                )
+                note_id = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM notes")
+                total = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    return {"status": "saved", "note_id": note_id, "total": total, "storage": "postgresql"}
 
 
 @app.get("/notes")
-async def list_notes():
-    return {"notes": notes, "count": len(notes)}
+def list_notes():
+    if not DATABASE_URL:
+        return {"notes": memory_notes, "count": len(memory_notes), "storage": "memory"}
 
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                init_db(cur)
+                cur.execute("SELECT id, text, created_at FROM notes ORDER BY id")
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    notes = [
+        {"id": r[0], "text": r[1], "created_at": r[2].strftime("%Y-%m-%d %H:%M:%S")}
+        for r in rows
+    ]
+    return {"notes": notes, "count": len(notes), "storage": "postgresql"}
