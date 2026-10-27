@@ -2,8 +2,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
+import json
 import httpx
 import psycopg2
+import redis
 
 app = FastAPI(title="Personal Assistant")
 
@@ -13,6 +15,12 @@ SECRET_KEY = os.getenv("APP_SECRET", "default_secret")
 # ЛР3: строка подключения к PostgreSQL.
 # Формат: postgresql://пользователь:пароль@хост:порт/имя_бд
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ЛР4: Redis для кэширования погоды.
+# В Docker Compose хост redis — это имя сервиса redis из docker-compose.yml.
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_TTL = int(os.getenv("CACHE_TTL", "120"))
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 
 class Note(BaseModel):
@@ -47,15 +55,21 @@ async def root():
     return {
         "message": f"👋 Привет, {OWNER}!",
         "service": "personal-assistant",
-        "version": "3.0",
+        "version": "4.0",
         "storage": "postgresql" if DATABASE_URL else "memory",
-        "endpoints": ["/health", "/me", "/notes", "/weather/{city}", "/secret/{key}"],
+        "endpoints": ["/health", "/me", "/notes", "/weather/{city}", "/cache/stats", "/secret/{key}"],
     }
 
 
 @app.get("/health")
 def health():
     result = {"status": "healthy", "owner": OWNER}
+    # ЛР4: состояние Redis показываем для информации, на статус не влияет
+    try:
+        redis_client.ping()
+        result["redis"] = "connected"
+    except redis.RedisError:
+        result["redis"] = "unavailable"
     if not DATABASE_URL:
         result["database"] = "not configured"
         return result
@@ -119,6 +133,18 @@ WEATHER_CODES: dict[int, str] = {
 
 @app.get("/weather/{city}")
 async def weather(city: str):
+    cache_key = f"weather:{OWNER}:{city.lower()}"
+
+    # ЛР4: сначала проверяем кэш
+    try:
+        cached = redis_client.get(cache_key)
+    except redis.RedisError:
+        cached = None  # Redis недоступен: просто идём во внешний API
+    if cached:
+        data = json.loads(cached)
+        data["source"] = "cache"
+        return data
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             geo_resp = await client.get(
@@ -148,7 +174,7 @@ async def weather(city: str):
 
             code = weather_data.get("weather_code", -1)
 
-            return {
+            result = {
                 "city": city_name,
                 "country": country,
                 "coordinates": {"lat": lat, "lon": lon},
@@ -156,9 +182,29 @@ async def weather(city: str):
                 "humidity_pct": weather_data["relative_humidity_2m"],
                 "wind_km_h": weather_data["wind_speed_10m"],
                 "condition": WEATHER_CODES.get(code, f"Code {code}"),
+                "source": "api",
             }
     except Exception as e:
+        # ошибки в кэш не кладём
         return {"error": f"Failed to get weather: {type(e).__name__}: {e}"}
+
+    # ЛР4: сохраняем результат в кэш на CACHE_TTL секунд
+    try:
+        redis_client.setex(cache_key, CACHE_TTL, json.dumps(result))
+    except redis.RedisError:
+        pass
+    return result
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    keys = redis_client.keys(f"weather:{OWNER}:*")
+    return {
+        "owner": OWNER,
+        "ttl_seconds": CACHE_TTL,
+        "cached_count": len(keys),
+        "cached_cities": sorted(k.split(":")[-1] for k in keys),
+    }
 
 
 # Обработчики заметок объявлены через обычный def (не async):
