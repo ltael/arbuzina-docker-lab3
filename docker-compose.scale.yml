@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:15
+    container_name: arbuzina-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - arbuzina-pgdata:/var/lib/postgresql/data
+    networks:
+      - arbuzina-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: arbuzina-redis
+    networks:
+      - arbuzina-backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    # container_name убран для масштабирования
+    ports:
+      - "${APP_PORT}"   # внутренний порт 8038, хостовый Docker назначит сам
+    environment:
+      APP_OWNER: ${APP_OWNER}
+      APP_SECRET: ${APP_SECRET}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CACHE_TTL: ${CACHE_TTL}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - arbuzina-backend
+
+volumes:
+  arbuzina-pgdata:
+    name: arbuzina-pgdata
+
+networks:
+  arbuzina-backend:
+    name: arbuzina-backend
+    driver: bridge
