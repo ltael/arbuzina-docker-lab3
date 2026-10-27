@@ -240,3 +240,81 @@ docker rmi arbuzina-assistant:v3
 4. **Опечатки в командах задания:** в `docker build` пропущена точка (контекст сборки), а в `docker volume ls │ grep` вместо вертикальной черты `|` стоит символ псевдографики `│`.
 5. **`python3 -m json.tool` экранирует кириллицу** (`\u041b...`). Решение: флаг `--no-ensure-ascii`.
 6. **Ping вне сети возвращал фиктивный адрес 198.18.0.x вместо ошибки.** Контейнер в сети по умолчанию отправлял DNS-запрос на DNS хоста, а VPN-клиент в режиме fake-IP отвечал поддельным адресом из диапазона 198.18.0.0/15. Пакеты не доходили, то есть изоляция работала, но вывод вводил в заблуждение. При отключённом VPN получен ожидаемый результат `bad address`.
+
+---
+
+# ЛР4. Docker Compose: оркестрация многоконтейнерного приложения
+
+**Студент:** Арбузина, ИСУ 465038 · **Ветка:** `lab-4`
+
+Приложение Personal Assistant из ЛР3 переведено с ручных команд `docker run` на Docker Compose. В стек добавлен Redis для кэширования ответов `/weather/{city}`, а также подготовлена конфигурация для масштабирования приложения до трёх экземпляров.
+
+## Персональные параметры
+
+| Параметр | Значение |
+|---|---|
+| PG_PORT | 5468 (5430 + 38) |
+| REDIS_PORT | 6408 (6370 + 38) |
+| APP_PORT | 8038 (8000 + 38) |
+| Префикс | arbuzina |
+| Секретный ключ | secret38arbuzina |
+| Имя БД | arbuzina38 |
+
+## Структура стека
+
+| Сервис | Контейнер | Образ | Порт (хост → контейнер) |
+|---|---|---|---|
+| app | arbuzina-assistant | собирается из Dockerfile | 8038 → 8038 |
+| db | arbuzina-postgres | postgres:15 | 5468 → 5432 |
+| redis | arbuzina-redis | redis:7-alpine | 6408 → 6379 |
+
+Все сервисы подключены к сети `arbuzina-backend` (bridge), данные PostgreSQL хранятся в volume `arbuzina-pgdata`. Приложение запускается только после того, как db и redis проходят healthcheck (`depends_on` + `condition: service_healthy`).
+
+Проект лежит в корне репозитория, а не в `solutions/assist-py/`, как и в ЛР3.
+
+## Файлы
+
+- `docker-compose.yml` — основная конфигурация (app + db + redis)
+- `docker-compose.scale.yml` — конфигурация для масштабирования (без `container_name` и фиксированного порта у app)
+- `.env.example` — шаблон переменных окружения (настоящий `.env` в `.gitignore`)
+- `app/main.py` — добавлены подключение к Redis, кэш в `/weather/{city}` и эндпоинт `/cache/stats`
+- `requirements.txt` — добавлена библиотека `redis`
+
+## Запуск
+
+```bash
+cp .env.example .env        # заполнить APP_SECRET и POSTGRES_PASSWORD
+docker compose up -d --build
+docker compose ps
+```
+
+Масштабирование до трёх экземпляров:
+
+```bash
+docker compose down
+docker compose -f docker-compose.scale.yml up -d --build --scale app=3
+docker compose -f docker-compose.scale.yml ps
+```
+
+## Кэширование
+
+Ключ кэша имеет вид `weather:arbuzina:<город>`, время жизни — 120 секунд (`CACHE_TTL`). Первый запрос идёт во внешний API Open-Meteo и возвращает `"source": "api"`, повторный в течение 120 секунд отдаётся из Redis с `"source": "cache"`. Ответы с ошибкой в кэш не попадают. Эндпоинт `/cache/stats` показывает владельца, TTL и список закэшированных городов.
+
+## Результаты проверки
+
+- Все три сервиса в статусе `Up (healthy)`.
+- Порядок запуска по логам: Redis готов в 13:03:51.046, PostgreSQL в 13:03:51.148, приложение стартовало в 13:03:57.275.
+- Повторный запрос `/weather/Moscow` возвращает `"source": "cache"`, TTL ключа уменьшается (120 → 68).
+- В сети `arbuzina-backend` все три контейнера: redis 172.18.0.2, postgres 172.18.0.3, assistant 172.18.0.4.
+- При `--scale app=3` копии получили порты 32770, 32769 и 32768. Запрос London через копию 1 вернул `api`, через копию 2 — `cache`, копия 3 видит `london` в `/cache/stats`: кэш общий для всех экземпляров.
+
+## Найденные проблемы
+
+| Проблема | Причина | Решение |
+|---|---|---|
+| `docker: unknown command: docker compose` | к Docker из репозитория Ubuntu не был установлен плагин Compose v2 | `sudo apt install docker-compose-v2` |
+| Конфликт имён с ресурсами ЛР3 | контейнеры, сеть `arbuzina-backend` и volume `arbuzina-pgdata` были созданы вручную в ЛР3; в старом volume лежала БД `assistant_38` | удалены перед запуском (`docker rm -f`, `docker network rm`, `docker volume rm`) |
+| Compose добавляет к именам сети и volume префикс проекта | по умолчанию сеть называется `arbuzina-docker-lab3_arbuzina-backend` | явно задан `name:` у сети и volume |
+| В `docker compose logs --tail=10` не видно старта приложения | последние строки лога app — запросы healthcheck к `/health` каждые 10 секунд | первые строки лога: `docker compose logs --timestamps app \| head -8` |
+| `WARNING Memory overcommit must be enabled!` в логах Redis | Redis рекомендует системную настройку `vm.overcommit_memory = 1` | на работу в учебном стеке не влияет, оставлено как есть |
+| У копий app при масштабировании статус `Up` без `(healthy)` | в `docker-compose.scale.yml` у app нет healthcheck | ожидаемое поведение, работоспособность проверена через `/health` каждой копии |
