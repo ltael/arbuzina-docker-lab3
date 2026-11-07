@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import json
+import socket
+from datetime import datetime, timezone
 import httpx
 import psycopg2
 import redis
@@ -55,7 +57,9 @@ async def root():
     return {
         "message": f"👋 Привет, {OWNER}!",
         "service": "personal-assistant",
-        "version": "4.0",
+        "version": "5.0",
+        "hostname": socket.gethostname(),  # ЛР5: в Kubernetes это имя пода
+        "server_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "storage": "postgresql" if DATABASE_URL else "memory",
         "endpoints": ["/health", "/me", "/notes", "/weather/{city}", "/cache/stats", "/secret/{key}"],
     }
@@ -63,13 +67,13 @@ async def root():
 
 @app.get("/health")
 def health():
-    result = {"status": "healthy", "owner": OWNER}
-    # ЛР4: состояние Redis показываем для информации, на статус не влияет
+    result = {"status": "healthy", "owner": OWNER, "hostname": socket.gethostname()}
+    # ЛР5: состояние Redis как true/false; на статус не влияет
     try:
         redis_client.ping()
-        result["redis"] = "connected"
+        result["redis"] = True
     except redis.RedisError:
-        result["redis"] = "unavailable"
+        result["redis"] = False
     if not DATABASE_URL:
         result["database"] = "not configured"
         return result
@@ -90,6 +94,8 @@ def health():
             content={
                 "status": "unhealthy",
                 "owner": OWNER,
+                "hostname": result["hostname"],
+                "redis": result["redis"],
                 "database": "unavailable",
                 "error": str(e).strip(),
             },
