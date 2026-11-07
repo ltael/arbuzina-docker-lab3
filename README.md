@@ -318,3 +318,62 @@ docker compose -f docker-compose.scale.yml ps
 | В `docker compose logs --tail=10` не видно старта приложения | последние строки лога app — запросы healthcheck к `/health` каждые 10 секунд | первые строки лога: `docker compose logs --timestamps app \| head -8` |
 | `WARNING Memory overcommit must be enabled!` в логах Redis | Redis рекомендует системную настройку `vm.overcommit_memory = 1` | на работу в учебном стеке не влияет, оставлено как есть |
 | У копий app при масштабировании статус `Up` без `(healthy)` | в `docker-compose.scale.yml` у app нет healthcheck | ожидаемое поведение, работоспособность проверена через `/health` каждой копии |
+
+---
+
+# ЛР5. Kubernetes
+
+**Студент:** Арбузина Елена Романовна, ИСУ 465038 · **Ветка:** `lab-5`
+
+Приложение из ЛР4 (FastAPI + PostgreSQL + Redis) развёрнуто в локальном кластере minikube. Манифесты лежат в каталоге `k8s/`, по одному ресурсу на файл.
+
+## Ресурсы
+
+| Файл | Ресурс | Назначение |
+|---|---|---|
+| `app-configmap.yaml` | ConfigMap `arbuzina-app-config` | APP_OWNER, POSTGRES_USER, POSTGRES_DB, REDIS_URL, CACHE_TTL |
+| `app-secret.example.yaml` | Secret `arbuzina-app-secret` | шаблон с учебными значениями; настоящий `app-secret.yaml` в `.gitignore` |
+| `postgres-pvc.yaml` | PVC `arbuzina-pgdata` | 1 ГБ постоянного хранилища для базы |
+| `postgres-deployment.yaml` | Deployment `arbuzina-postgres` | PostgreSQL 15, readinessProbe `pg_isready` |
+| `postgres-service.yaml` | Service ClusterIP `arbuzina-postgres:5432` | адрес базы внутри кластера |
+| `redis-deployment.yaml` | Deployment `arbuzina-redis` | Redis 7, readinessProbe `redis-cli ping` |
+| `redis-service.yaml` | Service ClusterIP `arbuzina-redis:6379` | адрес Redis внутри кластера |
+| `app-deployment.yaml` | Deployment `arbuzina-assistant` | 2 реплики, readiness и liveness пробы на `/health` |
+| `app-service.yaml` | Service NodePort `30038` | доступ к приложению с хоста |
+| `app-ingress.yaml` | Ingress `arbuzina.local` | бонус: вход по доменному имени |
+
+## Запуск
+
+```bash
+minikube start --driver=docker --cpus=2 --memory=4096
+docker build -t arbuzina-assistant:lab5 .
+minikube image load arbuzina-assistant:lab5
+cp k8s/app-secret.example.yaml k8s/app-secret.yaml   # вписать свои пароли
+```
+
+Порядок применения манифестов: сначала настройки, потом база и кэш, потом приложение.
+
+```bash
+kubectl apply -f k8s/app-configmap.yaml -f k8s/app-secret.yaml
+kubectl apply -f k8s/postgres-pvc.yaml -f k8s/postgres-deployment.yaml -f k8s/postgres-service.yaml
+kubectl apply -f k8s/redis-deployment.yaml -f k8s/redis-service.yaml
+kubectl apply -f k8s/app-deployment.yaml -f k8s/app-service.yaml
+```
+
+Или всё сразу: `kubectl apply -f k8s/`.
+
+## Проверка
+
+```bash
+kubectl get pods                  # все поды Running, 1/1
+APP=$(minikube service arbuzina-assistant --url)
+curl $APP/                        # hostname = имя пода
+curl $APP/health                  # "redis": true, "database": "connected"
+curl $APP/weather/Moscow          # source: api, повторно source: cache
+kubectl describe pod <имя-пода>   # Liveness, Readiness, Ready True
+```
+
+## Readiness и liveness
+
+- **readinessProbe** проверяет, готов ли под принимать запросы. Пока проба не проходит, Service не отправляет на под трафик, но под не перезапускается.
+- **livenessProbe** проверяет, жив ли под. Если проба не проходит несколько раз подряд, Kubernetes перезапускает контейнер.
