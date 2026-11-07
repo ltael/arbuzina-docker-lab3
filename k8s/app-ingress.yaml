@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: arbuzina-ingress
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: arbuzina.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: arbuzina-assistant
+                port:
+                  number: 8038
