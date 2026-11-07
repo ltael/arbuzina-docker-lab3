@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arbuzina-redis
+  labels:
+    app: arbuzina-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arbuzina-redis
+  template:
+    metadata:
+      labels:
+        app: arbuzina-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
