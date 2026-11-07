@@ -36,3 +36,15 @@ spec:
                   key: POSTGRES_PASSWORD
             - name: DATABASE_URL
               value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@arbuzina-postgres:5432/$(POSTGRES_DB)"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8038
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8038
+            initialDelaySeconds: 15
+            periodSeconds: 20
